@@ -58,6 +58,7 @@ class SoundEngine {
       this.initEngineSound();
       this.initSnowCrunchSound();
       this.initAmbientWindSound();
+      this.initAmbientMusic();
 
       this.initialized = true;
     } catch {
@@ -285,6 +286,73 @@ class SoundEngine {
 
     source.start(now);
     source.stop(now + 0.75);
+  }
+
+  /**
+   * Generative ambient pad: slow overlapping chords and the odd pentatonic bell through a soft echo.
+   * Nothing to download or license, and it never repeats exactly.
+   */
+  private initAmbientMusic(): void {
+    if (!this.ctx || !this.masterGain) return;
+    const ctx = this.ctx;
+    const bus = ctx.createGain();
+    bus.gain.value = 0.11;
+    const tone = ctx.createBiquadFilter();
+    tone.type = 'lowpass';
+    tone.frequency.value = 1600;
+    const echo = ctx.createDelay(1.5);
+    echo.delayTime.value = 0.45;
+    const feedback = ctx.createGain();
+    feedback.gain.value = 0.38;
+    bus.connect(tone);
+    tone.connect(this.masterGain);
+    tone.connect(echo);
+    echo.connect(feedback);
+    feedback.connect(echo);
+    echo.connect(this.masterGain);
+
+    // Cmaj7 -> Am7 -> Fmaj7 -> G6, voiced low and warm
+    const chords = [
+      [130.81, 196.0, 246.94, 329.63],
+      [110.0, 196.0, 261.63, 329.63],
+      [87.31, 174.61, 220.0, 329.63],
+      [98.0, 196.0, 246.94, 293.66],
+    ];
+    let step = 0;
+    const playBar = () => {
+      const t = ctx.currentTime + 0.05;
+      for (const f of chords[step++ % chords.length]) {
+        const osc = ctx.createOscillator();
+        osc.type = 'triangle';
+        osc.frequency.value = f;
+        osc.detune.value = (Math.random() - 0.5) * 8; // a little chorus
+        const env = ctx.createGain();
+        env.gain.setValueAtTime(0, t);
+        env.gain.linearRampToValueAtTime(0.22, t + 2.5);
+        env.gain.linearRampToValueAtTime(0, t + 9); // bars overlap by 2s, so the pad never drops out
+        osc.connect(env);
+        env.connect(bus);
+        osc.start(t);
+        osc.stop(t + 9.1);
+      }
+      const bells = 1 + Math.floor(Math.random() * 2);
+      for (let b = 0; b < bells; b++) {
+        const bt = t + 1 + Math.random() * 5;
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = this.pentatonicNotes[Math.floor(Math.random() * this.pentatonicNotes.length)] * 2;
+        const env = ctx.createGain();
+        env.gain.setValueAtTime(0, bt);
+        env.gain.linearRampToValueAtTime(0.09, bt + 0.02);
+        env.gain.exponentialRampToValueAtTime(0.0001, bt + 3);
+        osc.connect(env);
+        env.connect(bus);
+        osc.start(bt);
+        osc.stop(bt + 3.1);
+      }
+    };
+    playBar();
+    setInterval(playBar, 7000);
   }
 
   /**

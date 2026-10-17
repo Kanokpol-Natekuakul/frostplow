@@ -19,6 +19,7 @@ export interface WeatherConfig {
   fogColor: number;
   lightIntensity: number;
   windAudioVolume: number;
+  snowfallRate: number; // fraction of the road re-covered per second (0 = snow stays cleared)
 }
 
 export interface UpgradeTier {

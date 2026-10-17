@@ -5,6 +5,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    base: './', // relative asset URLs: works at any path on any static host
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {

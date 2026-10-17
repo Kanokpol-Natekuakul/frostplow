@@ -3,6 +3,16 @@
  * Continuous held keys, edge-triggered one-shots, and focus hygiene
  */
 
+export interface VirtualInput {
+  forward: boolean;
+  backward: boolean;
+  left: boolean;
+  right: boolean;
+  action: boolean;
+  stickX: number;
+  stickY: number;
+}
+
 export interface InputHub {
   forward: boolean;
   backward: boolean;
@@ -10,11 +20,13 @@ export interface InputHub {
   right: boolean;
   drift: boolean;
   action: boolean; // blower
+  stickX: number; // touch joystick, -1..1 screen space (y down)
+  stickY: number;
   consumeAction: () => boolean;
   consumePause: () => boolean;
   consumeMute: () => boolean;
   consumeCameraToggle: () => boolean;
-  setVirtualInput: (input: Partial<{ forward: boolean; backward: boolean; left: boolean; right: boolean; action: boolean }>) => void;
+  setVirtualInput: (input: Partial<VirtualInput>) => void;
   dispose: () => void;
 }
 
@@ -26,12 +38,14 @@ export function createInputHub(): InputHub {
   let camJustPressed = false;
 
   // Virtual touch input overlays
-  const virtual = {
+  const virtual: VirtualInput = {
     forward: false,
     backward: false,
     left: false,
     right: false,
     action: false,
+    stickX: 0,
+    stickY: 0,
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -69,6 +83,8 @@ export function createInputHub(): InputHub {
     virtual.left = false;
     virtual.right = false;
     virtual.action = false;
+    virtual.stickX = 0;
+    virtual.stickY = 0;
   };
 
   window.addEventListener('keydown', onKeyDown);
@@ -94,6 +110,12 @@ export function createInputHub(): InputHub {
     },
     get action() {
       return heldKeys.has('Space') || virtual.action;
+    },
+    get stickX() {
+      return virtual.stickX;
+    },
+    get stickY() {
+      return virtual.stickY;
     },
     consumeAction: () => {
       const pressed = actionJustPressed || virtual.action;

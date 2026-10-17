@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import type { GameState, UpgradesState, VehicleStats, WeatherType, GameMetrics } from './game/types.ts';
-import { calculateVehicleStats, getWeatherPreset, getUpgradeInfo } from './game/logic.ts';
+import type { GameState, UpgradesState, WeatherType, GameMetrics } from './game/types.ts';
+import { calculateVehicleStats, getWeatherPreset, getUpgradeInfo, parseSave, STORM_CALMS_AT } from './game/logic.ts';
+import { VILLAGES } from './game/villages.ts';
 import { SnowWorld } from './game/world.ts';
 import { createInputHub, InputHub } from './game/input.ts';
 import { soundEngine } from './game/audio.ts';
@@ -13,26 +14,44 @@ import { GameHUD } from './components/GameHUD.tsx';
 import { PauseModal } from './components/PauseModal.tsx';
 import { VictoryModal } from './components/VictoryModal.tsx';
 
+const SAVE_KEY = 'frostplow:save';
+
+/** localStorage throws when storage is disabled (private modes, some in-app browsers): then we just don't save. */
+function loadSave() {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(SAVE_KEY);
+  } catch {
+    // no storage
+  }
+  return parseSave(raw, VILLAGES.length);
+}
+
 export default function App() {
   const mountRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<SnowWorld | null>(null);
   const inputRef = useRef<InputHub | null>(null);
+  const [save] = useState(loadSave);
 
   // Game State Machine
   const [gameState, setGameState] = useState<GameState>('title');
   const gameStateRef = useRef<GameState>('title');
   gameStateRef.current = gameState;
 
-  // Upgrades State
-  const [upgrades, setUpgrades] = useState<UpgradesState>({
-    bladeWidth: 1,
-    enginePower: 1,
-    saltSpreader: 0,
-    snowBlower: 0,
-  });
+  // Progress (persisted)
+  const [upgrades, setUpgrades] = useState<UpgradesState>(save.upgrades);
+  const [villageIndex, setVillageIndex] = useState(save.village);
+  const villageRef = useRef(villageIndex);
+  villageRef.current = villageIndex;
+  const [best, setBest] = useState(save.best);
+  const village = VILLAGES[villageIndex];
+  const isLastVillage = villageIndex === VILLAGES.length - 1;
+  const nextVillageIndex = isLastVillage ? 0 : villageIndex + 1;
 
-  // Weather State
-  const [weatherType, setWeatherType] = useState<WeatherType>('flurries');
+  // Weather belongs to the village; a blizzard eases to flurries once the roads are mostly clear
+  const [weatherType, setWeatherType] = useState<WeatherType>(village.weather);
+  const weatherRef = useRef(weatherType);
+  weatherRef.current = weatherType;
 
   // Camera Mode State
   const [cameraMode, setCameraMode] = useState<'isometric' | 'close' | 'top'>('isometric');
@@ -45,7 +64,7 @@ export default function App() {
     snowClearedSqM: 0,
     totalSnowSqM: 100,
     cleanPercent: 0,
-    coins: 20, // Starting cozy pocket money
+    coins: save.coins,
     score: 0,
     comboMultiplier: 1.0,
     comboTimer: 0,
@@ -58,6 +77,23 @@ export default function App() {
   useEffect(() => {
     document.body.dataset.state = gameState;
   }, [gameState]);
+
+  // Persist progress: a tiny JSON, and coins change at most ~10x/s.
+  // On the victory screen the save already points at the next village, so closing the tab there moves you on.
+  const savedVillage = gameState === 'gameover' ? nextVillageIndex : villageIndex;
+  useEffect(() => {
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify({ coins: hudMetrics.coins, upgrades, village: savedVillage, best }));
+    } catch {
+      // storage full or disabled: progress just isn't kept
+    }
+  }, [hudMetrics.coins, upgrades, savedVillage, best]);
+
+  const applyWeather = (type: WeatherType) => {
+    weatherRef.current = type;
+    setWeatherType(type);
+    worldRef.current?.setWeather(getWeatherPreset(type));
+  };
 
   // Handle Autostart URL parameter
   useEffect(() => {
@@ -85,6 +121,7 @@ export default function App() {
       mountRef.current,
       initialStats,
       initialWeather,
+      VILLAGES[villageRef.current],
       {
         onMetricsUpdate: (newMetrics) => {
           const now = performance.now();
@@ -94,8 +131,23 @@ export default function App() {
             setHudMetrics((prev) => ({ ...prev, ...newMetrics }));
           }
 
-          // Trigger victory if roads hit 100%
-          if (newMetrics.cleanPercent && newMetrics.cleanPercent >= 100 && gameStateRef.current === 'playing') {
+          const clean = newMetrics.cleanPercent ?? 0;
+          if (weatherRef.current === 'blizzard' && clean >= STORM_CALMS_AT) {
+            applyWeather('flurries');
+          }
+
+          // Village cleared: record the time and celebrate with final numbers, not a throttled snapshot
+          if (clean >= 100 && gameStateRef.current === 'playing') {
+            gameStateRef.current = 'gameover';
+            const time = newMetrics.shiftDurationSec ?? 0;
+            const v = villageRef.current;
+            setBest((prev) => {
+              const next = [...prev];
+              const old = next[v];
+              if (old == null || time < old) next[v] = time;
+              return next;
+            });
+            setHudMetrics((prev) => ({ ...prev, ...newMetrics }));
             setGameState('gameover');
           }
         },
@@ -110,7 +162,7 @@ export default function App() {
     );
     worldRef.current = world;
     if (import.meta.env.DEV) (window as any).__frost = world; // live checks from the browser console
-    world.addCoins(20); // Grant starter coins
+    world.addCoins(save.coins);
 
     // Unified Game Simulation Loop
     let animId: number;
@@ -157,6 +209,8 @@ export default function App() {
           left: currentInput.left,
           right: currentInput.right,
           drift: currentInput.drift,
+          stickX: currentInput.stickX,
+          stickY: currentInput.stickY,
         });
       }
     };
@@ -199,11 +253,13 @@ export default function App() {
     }
   };
 
-  // Weather Change Handler
-  const handleSetWeather = (type: WeatherType) => {
-    setWeatherType(type);
-    const preset = getWeatherPreset(type);
-    worldRef.current?.setWeather(preset);
+  // Load a village (fresh snow, its own weather) and continue in the given state
+  const goToVillage = (i: number, state: GameState = 'playing') => {
+    setVillageIndex(i);
+    villageRef.current = i;
+    applyWeather(VILLAGES[i].weather);
+    worldRef.current?.loadVillage(VILLAGES[i]);
+    setGameState(state);
   };
 
   // Camera Mode Toggle
@@ -220,15 +276,14 @@ export default function App() {
     setIsMuted(nextMuted);
   };
 
-  // Restart Run
-  const handleRestart = () => {
-    worldRef.current?.resetRun();
-    setGameState('playing');
-  };
-
-  // Return to Title
-  const handleTitle = () => {
-    setGameState('title');
+  const handleResetProgress = () => {
+    if (!window.confirm('Reset all progress? Coins, upgrades and cleared villages will be lost.')) return;
+    try {
+      localStorage.removeItem(SAVE_KEY);
+    } catch {
+      // no storage
+    }
+    window.location.reload();
   };
 
   return (
@@ -242,6 +297,9 @@ export default function App() {
           onStart={startGame}
           isMuted={isMuted}
           onToggleMute={handleToggleMute}
+          villageLabel={`Village ${villageIndex + 1} of ${VILLAGES.length} · ${village.name}`}
+          bestTime={best[villageIndex] ?? null}
+          onResetProgress={handleResetProgress}
         />
       )}
 
@@ -250,11 +308,11 @@ export default function App() {
         <GameHUD
           metrics={hudMetrics}
           upgrades={upgrades}
+          villageName={village.name}
           weatherType={weatherType}
           cameraMode={cameraMode}
           isMuted={isMuted}
           onUpgrade={handleUpgrade}
-          onSetWeather={handleSetWeather}
           onToggleCamera={handleToggleCamera}
           onToggleMute={handleToggleMute}
           onPause={() => setGameState('paused')}
@@ -268,8 +326,8 @@ export default function App() {
           metrics={hudMetrics}
           isMuted={isMuted}
           onResume={() => setGameState('playing')}
-          onRestart={handleRestart}
-          onTitle={handleTitle}
+          onRestart={() => goToVillage(villageIndex)}
+          onTitle={() => setGameState('title')}
           onToggleMute={handleToggleMute}
         />
       )}
@@ -278,8 +336,13 @@ export default function App() {
       {gameState === 'gameover' && (
         <VictoryModal
           metrics={hudMetrics}
-          onPlayAgain={handleRestart}
-          onTitle={handleTitle}
+          villageName={village.name}
+          nextVillageName={VILLAGES[nextVillageIndex].name}
+          isLastVillage={isLastVillage}
+          bestTime={best[villageIndex] ?? null}
+          onNext={() => goToVillage(nextVillageIndex)}
+          onReplay={() => goToVillage(villageIndex)}
+          onTitle={() => goToVillage(nextVillageIndex, 'title')}
         />
       )}
     </div>

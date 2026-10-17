@@ -5,14 +5,26 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type { WeatherConfig, VehicleStats, GameMetrics } from './types.ts';
 import { soundEngine } from './audio.ts';
+import { layoutProps, roadDistance, type RoadStroke, type VillageDef } from './villages.ts';
 import {
   AUTO_FINISH_RATIO,
+  forEachInDisc,
   WEATHER_PRESETS,
   calculateCleanliness,
   calculateSnowPlowGain,
   clearSnowDisc,
   updateCombo,
 } from './logic.ts';
+
+export interface DriveInput {
+  forward: boolean;
+  backward: boolean;
+  left: boolean;
+  right: boolean;
+  drift: boolean;
+  stickX?: number; // touch joystick, screen space -1..1 (y down)
+  stickY?: number;
+}
 
 export interface WorldCallbacks {
   onMetricsUpdate: (metrics: Partial<GameMetrics>) => void;
@@ -105,12 +117,23 @@ export class SnowWorld {
   // Lights & Environment
   private sunLight!: THREE.DirectionalLight;
   private hemiLight!: THREE.HemisphereLight;
-  private isHeadless: boolean = false;
+  private lowQuality: boolean = false; // phones, headless and software GL: no shadows, no AA, capped pixel ratio
+
+  // Village layout
+  private propsGroup = new THREE.Group();
+  private roadPixels = new Int32Array(0); // indices of every road pixel, for blizzard drift
+  private roadDist: Float32Array = new Float32Array(0); // pixels from the nearest road, for the snowbank edge
+  private spawn = { x: 0, z: 0, heading: 0 };
+  private villagePay = 1; // coin multiplier of the current village
+  private snowfallBank = 0; // road pixels owed to the blizzard
+  private tmpDir = new THREE.Vector3();
+  private readonly MAX_SMOKE = 48;
 
   constructor(
     container: HTMLElement,
     initialStats: VehicleStats,
     initialWeather: WeatherConfig,
+    village: VillageDef,
     callbacks: WorldCallbacks
   ) {
     this.container = container;
@@ -118,7 +141,8 @@ export class SnowWorld {
     this.weather = initialWeather;
     this.callbacks = callbacks;
 
-    this.isHeadless = navigator.webdriver || /HeadlessChrome/i.test(navigator.userAgent);
+    this.lowQuality =
+      navigator.webdriver || /HeadlessChrome/i.test(navigator.userAgent) || window.matchMedia('(pointer: coarse)').matches;
 
     // Three.js Scene Setup
     this.scene = new THREE.Scene();
@@ -127,17 +151,23 @@ export class SnowWorld {
 
     // Renderer
     this.renderer = new THREE.WebGLRenderer({
-      antialias: !this.isHeadless,
+      antialias: !this.lowQuality,
       powerPreference: 'high-performance',
       preserveDrawingBuffer: false,
     });
+    // Software GL (SwiftShader/llvmpipe) gets the low tier too: pick quality from the GPU, not the CPU
+    const gl = this.renderer.getContext();
+    const gpuInfo = gl.getExtension('WEBGL_debug_renderer_info');
+    if (gpuInfo && /swiftshader|llvmpipe|software/i.test(String(gl.getParameter(gpuInfo.UNMASKED_RENDERER_WEBGL)))) {
+      this.lowQuality = true;
+    }
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.15;
-    this.renderer.setPixelRatio(this.isHeadless ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.lowQuality ? 1.5 : 2));
     this.renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
 
-    if (!this.isHeadless) {
+    if (!this.lowQuality) {
       this.renderer.shadowMap.enabled = true;
       this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     }
@@ -160,9 +190,15 @@ export class SnowWorld {
 
     // Build World Elements
     this.setupLighting();
-    this.setupSnowDeformationGround();
-    this.buildVillageProps();
+    this.villagePay = village.pay;
+    this.setupSnowDeformationGround(village);
+    this.scene.add(this.propsGroup);
+    this.buildVillageProps(village.seed);
     this.buildVehicle();
+    this.vehiclePos.set(this.spawn.x, 0.4, this.spawn.z);
+    this.vehicleHeading = this.spawn.heading;
+    this.updateVehicleTransform();
+    this.cameraTarget.copy(this.vehiclePos);
     this.setupSnowfall();
     this.setupSprayParticles();
     this.setupSmokeParticles();
@@ -186,7 +222,7 @@ export class SnowWorld {
     // Directional Key Sun Light
     this.sunLight = new THREE.DirectionalLight(0xfffaed, this.weather.lightIntensity);
     this.sunLight.position.set(35, 50, 35);
-    if (!this.isHeadless) {
+    if (!this.lowQuality) {
       this.sunLight.castShadow = true;
       this.sunLight.shadow.mapSize.width = 1024;
       this.sunLight.shadow.mapSize.height = 1024;
@@ -206,7 +242,7 @@ export class SnowWorld {
   /**
    * Procedural Ground with real-time dynamic plowing snow canvas
    */
-  private setupSnowDeformationGround(): void {
+  private setupSnowDeformationGround(village: VillageDef): void {
     // Create Snow Canvas
     this.snowCanvas = document.createElement('canvas');
     this.snowCanvas.width = this.CANVAS_RES;
@@ -220,7 +256,7 @@ export class SnowWorld {
     this.roadMaskCtx = this.roadMaskCanvas.getContext('2d')!;
 
     // Draw Road Network on Road Mask
-    this.drawRoadNetwork(this.roadMaskCtx);
+    this.drawRoadNetwork(this.roadMaskCtx, village.roads);
 
     // Fill Snow Canvas: Where roads are, draw fresh white fluffy snow!
     this.resetSnow();
@@ -243,69 +279,66 @@ export class SnowWorld {
     });
 
     this.groundPlane = new THREE.Mesh(groundGeo, groundMat);
-    this.groundPlane.receiveShadow = !this.isHeadless;
+    this.groundPlane.receiveShadow = !this.lowQuality;
     this.scene.add(this.groundPlane);
 
     // Perimeter Natural Mountain Berms & Snow Banks
     this.buildPerimeterHills();
   }
 
-  private drawRoadNetwork(ctx: CanvasRenderingContext2D): void {
+  private drawRoadNetwork(ctx: CanvasRenderingContext2D, roads: RoadStroke[]): void {
     const W = this.CANVAS_RES;
-    const H = this.CANVAS_RES;
 
-    // Background is non-road
+    // Background is non-road; roads are white strokes of SVG paths in a 0-100 map space
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, W, H);
-
-    // Draw main roads (White = road, Black = non-road/grass)
+    ctx.fillRect(0, 0, W, W);
+    ctx.setTransform(W / 100, 0, 0, W / 100, 0, 0);
     ctx.strokeStyle = '#ffffff';
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-
-    // Main Village Loop & Avenues
-    ctx.lineWidth = 42;
-
-    // Outer scenic loop
-    ctx.beginPath();
-    ctx.arc(W * 0.5, H * 0.5, W * 0.36, 0, Math.PI * 2);
-    ctx.stroke();
-
-    // Central crossroad and cozy village square
-    ctx.beginPath();
-    ctx.moveTo(W * 0.14, H * 0.5);
-    ctx.lineTo(W * 0.86, H * 0.5);
-    ctx.moveTo(W * 0.5, H * 0.14);
-    ctx.lineTo(W * 0.5, H * 0.86);
-    ctx.stroke();
-
-    // Village Center Roundabout
-    ctx.beginPath();
-    ctx.arc(W * 0.5, H * 0.5, W * 0.14, 0, Math.PI * 2);
-    ctx.stroke();
-
-    // Cul-de-sacs to cozy chalets
-    ctx.lineWidth = 28;
-    ctx.beginPath();
-    ctx.moveTo(W * 0.3, H * 0.3);
-    ctx.lineTo(W * 0.22, H * 0.22);
-    ctx.moveTo(W * 0.7, H * 0.3);
-    ctx.lineTo(W * 0.78, H * 0.22);
-    ctx.moveTo(W * 0.3, H * 0.7);
-    ctx.lineTo(W * 0.22, H * 0.78);
-    ctx.moveTo(W * 0.7, H * 0.7);
-    ctx.lineTo(W * 0.78, H * 0.78);
-    ctx.stroke();
+    for (const road of roads) {
+      ctx.lineWidth = road.width;
+      ctx.stroke(new Path2D(road.d));
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
 
     // Count road pixels for coverage metrics and keep the mask for the snow ledger
-    const imgData = ctx.getImageData(0, 0, W, H);
-    let count = 0;
+    const imgData = ctx.getImageData(0, 0, W, W);
+    const roadIdx: number[] = [];
     for (let p = 0; p < this.roadMask.length; p++) {
       this.roadMask[p] = imgData.data[p * 4] > 100 ? 1 : 0;
-      count += this.roadMask[p];
+      if (this.roadMask[p]) roadIdx.push(p);
     }
-    this.totalRoadPixels = count;
-    this.metrics.totalSnowSqM = Math.round(count * (this.WORLD_SIZE / this.CANVAS_RES) ** 2);
+    this.roadPixels = Int32Array.from(roadIdx);
+    this.roadDist = roadDistance(this.roadMask, W);
+    this.totalRoadPixels = roadIdx.length;
+    this.metrics.totalSnowSqM = Math.round(this.totalRoadPixels * (this.WORLD_SIZE / W) ** 2);
+
+    // Spawn on the road pixel nearest the map centre, facing the longest stretch of road
+    let best = roadIdx[0];
+    let bestD = Infinity;
+    for (const p of roadIdx) {
+      const d = (p % W - W / 2) ** 2 + (Math.floor(p / W) - W / 2) ** 2;
+      if (d < bestD) [best, bestD] = [p, d];
+    }
+    const sx = best % W;
+    const sy = Math.floor(best / W);
+    let heading = 0;
+    let longest = -1;
+    for (let k = 0; k < 16; k++) {
+      const h = (k / 16) * Math.PI * 2;
+      let run = 0;
+      while (run < 80) {
+        const x = Math.round(sx + Math.sin(h) * run);
+        const y = Math.round(sy + Math.cos(h) * run);
+        if (x < 0 || y < 0 || x >= W || y >= W || !this.roadMask[y * W + x]) break;
+        run++;
+      }
+      if (run > longest) [heading, longest] = [h, run];
+    }
+    const m = this.WORLD_SIZE / W;
+    this.spawn = { x: (sx + 0.5) * m - this.WORLD_SIZE / 2, z: (sy + 0.5) * m - this.WORLD_SIZE / 2, heading };
   }
 
   private resetSnow(): void {
@@ -330,6 +363,14 @@ export class SnowWorld {
     // On top of roads: draw fresh deep powder snow (slightly elevated visual brightness)
     const snowData = this.snowCtx.getImageData(0, 0, W, H);
     for (let p = 0; p < this.roadMask.length; p++) {
+      const d = this.roadDist[p];
+      if (!this.roadMask[p] && d <= 5) {
+        // Blue snowbank shadow along every road, so the layout reads before it is plowed
+        const t = (d - 1) / 4;
+        snowData.data[p * 4] = 178 + (snowData.data[p * 4] - 178) * t;
+        snowData.data[p * 4 + 1] = 198 + (snowData.data[p * 4 + 1] - 198) * t;
+        snowData.data[p * 4 + 2] = 222 + (snowData.data[p * 4 + 2] - 222) * t;
+      }
       if (this.roadMask[p]) {
         snowData.data[p * 4] = 248;     // R
         snowData.data[p * 4 + 1] = 252; // G
@@ -368,89 +409,87 @@ export class SnowWorld {
       const s = 1.2 + Math.random() * 0.6;
       hill.scale.set(s, s * 0.9, s);
       hill.rotation.y = Math.random() * Math.PI;
-      hill.receiveShadow = !this.isHeadless;
+      hill.receiveShadow = !this.lowQuality;
       this.scene.add(hill);
     });
   }
 
   /**
-   * Procedural Village Assets: 8-12 Chalets, Pine Trees, Streetlamps, Snowmen, Mailboxes
+   * Procedural village props laid out from the road mask: chalets, pines, streetlamps and a snowman
    */
-  private buildVillageProps(): void {
-    // 1. Cozy Alpine Cottages
-    const chaletCoords = [
-      { x: -18, z: -18, rot: 0.3 },
-      { x: 18, z: -18, rot: -0.4 },
-      { x: -18, z: 18, rot: 2.2 },
-      { x: 18, z: 18, rot: -2.3 },
-      { x: -28, z: 0, rot: 1.57 },
-      { x: 28, z: 0, rot: -1.57 },
-      { x: 0, z: -28, rot: 0 },
-      { x: 0, z: 28, rot: 3.14 },
-    ];
+  private buildVillageProps(seed: number): void {
+    this.clearProps();
+    const layout = layoutProps(this.roadMask, this.CANVAS_RES, this.WORLD_SIZE, seed);
 
-    chaletCoords.forEach((coord) => {
+    // 1. Cozy Alpine Cottages, doors to the road
+    layout.chalets.forEach(({ x, z, rot }) => {
       const chalet = this.createProceduralChalet();
-      chalet.position.set(coord.x, 0, coord.z);
-      chalet.rotation.y = coord.rot;
-      this.scene.add(chalet);
+      chalet.position.set(x, 0, z);
+      chalet.rotation.y = rot;
+      this.propsGroup.add(chalet);
 
-      // Register chimney position for rising fireplace smoke
-      const chimneyWorldPos = new THREE.Vector3(coord.x + 1.2, 5.2, coord.z + 0.8);
-      for (let s = 0; s < 4; s++) {
+      // The chimney sits at (1.2, 0.8) in the chalet's own x/z, so rotate that offset with the house
+      const c = Math.cos(rot);
+      const s = Math.sin(rot);
+      const chimneyWorldPos = new THREE.Vector3(x + 1.2 * c + 0.8 * s, 5.2, z - 1.2 * s + 0.8 * c);
+      for (let k = 0; k < 4; k++) {
         this.smokeParticles.push({
-          pos: chimneyWorldPos.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.2, s * 0.4, (Math.random() - 0.5) * 0.2)),
+          pos: chimneyWorldPos.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.2, k * 0.4, (Math.random() - 0.5) * 0.2)),
           basePos: chimneyWorldPos.clone(),
           life: Math.random() * 2.0,
           maxLife: 2.5,
         });
       }
     });
+    if (this.smokeInstancedMesh) this.smokeInstancedMesh.count = this.smokeParticles.length;
 
     // 2. Pine Trees with Snow Clumps
     const treeMatTrunk = new THREE.MeshStandardMaterial({ color: 0x4a3525, roughness: 0.85 });
     const treeMatFoliage = new THREE.MeshStandardMaterial({ color: 0x224933, roughness: 0.75, flatShading: true });
     const treeMatSnow = new THREE.MeshStandardMaterial({ color: 0xf5f9ff, roughness: 0.8, flatShading: true });
-
-    const treePositions = [
-      [-10, 0, -10], [10, 0, -10], [-10, 0, 10], [10, 0, 10],
-      [-32, 0, -15], [-35, 0, 12], [32, 0, -14], [34, 0, 16],
-      [-12, 0, -32], [14, 0, -34], [-15, 0, 32], [16, 0, 35],
-      [-22, 0, -28], [24, 0, -26], [-25, 0, 25], [26, 0, 24],
-      [-5, 0, -36], [6, 0, 36], [-36, 0, -5], [36, 0, 6],
-    ];
-
-    treePositions.forEach(([tx, , tz]) => {
+    layout.trees.forEach(({ x, z }) => {
       const tree = this.createProceduralPineTree(treeMatTrunk, treeMatFoliage, treeMatSnow);
-      tree.position.set(tx + (Math.random() - 0.5) * 2, 0, tz + (Math.random() - 0.5) * 2);
+      tree.position.set(x, 0, z);
       const sc = 0.8 + Math.random() * 0.4;
       tree.scale.set(sc, sc, sc);
       tree.rotation.y = Math.random() * Math.PI * 2;
-      this.scene.add(tree);
+      this.propsGroup.add(tree);
     });
 
     // 3. Vintage Iron Streetlamps with Warm Amber Point Lights
-    const lampCoords = [
-      { x: -7, z: -7 }, { x: 7, z: -7 }, { x: -7, z: 7 }, { x: 7, z: 7 },
-      { x: -16, z: 0 }, { x: 16, z: 0 }, { x: 0, z: -16 }, { x: 0, z: 16 },
-    ];
-
-    lampCoords.forEach((l) => {
+    layout.lamps.forEach(({ x, z }) => {
       const lamp = this.createProceduralStreetlamp();
-      lamp.position.set(l.x, 0, l.z);
-      this.scene.add(lamp);
-
-      // Warm glow pointlight
+      lamp.position.set(x, 0, z);
+      this.propsGroup.add(lamp);
       const warmLight = new THREE.PointLight(0xffae42, 1.3, 11, 1.8);
-      warmLight.position.set(l.x, 3.4, l.z);
-      this.scene.add(warmLight);
+      warmLight.position.set(x, 3.4, z);
+      this.propsGroup.add(warmLight);
     });
 
-    // 4. Village Center Monument / Cozy Gazebo or Snowman in scenic plaza
+    // 4. Village snowman
     const villageSnowman = this.createSnowman();
-    villageSnowman.position.set(0, 0, -8);
+    villageSnowman.position.set(layout.snowman.x, 0, layout.snowman.z);
     villageSnowman.scale.set(1.4, 1.4, 1.4);
-    this.scene.add(villageSnowman);
+    this.propsGroup.add(villageSnowman);
+  }
+
+  private clearProps(): void {
+    this.propsGroup.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      mesh.geometry.dispose();
+      (Array.isArray(mesh.material) ? mesh.material : [mesh.material]).forEach((mat) => mat.dispose());
+    });
+    this.propsGroup.clear();
+    this.smokeParticles.length = 0;
+  }
+
+  /** Swaps in another village: roads, props and a fresh run. */
+  public loadVillage(village: VillageDef): void {
+    this.villagePay = village.pay;
+    this.drawRoadNetwork(this.roadMaskCtx, village.roads);
+    this.buildVillageProps(village.seed);
+    this.resetRun();
   }
 
   private createProceduralChalet(): THREE.Group {
@@ -461,8 +500,8 @@ export class SnowWorld {
     const baseMat = new THREE.MeshStandardMaterial({ color: 0x6e757d, roughness: 0.9 });
     const baseMesh = new THREE.Mesh(baseGeo, baseMat);
     baseMesh.position.y = 0.35;
-    baseMesh.castShadow = !this.isHeadless;
-    baseMesh.receiveShadow = !this.isHeadless;
+    baseMesh.castShadow = !this.lowQuality;
+    baseMesh.receiveShadow = !this.lowQuality;
     group.add(baseMesh);
 
     // 2. Timber Log Walls
@@ -470,8 +509,8 @@ export class SnowWorld {
     const wallMat = new THREE.MeshStandardMaterial({ color: 0x8a5229, roughness: 0.7 });
     const wallMesh = new THREE.Mesh(wallGeo, wallMat);
     wallMesh.position.y = 2.1;
-    wallMesh.castShadow = !this.isHeadless;
-    wallMesh.receiveShadow = !this.isHeadless;
+    wallMesh.castShadow = !this.lowQuality;
+    wallMesh.receiveShadow = !this.lowQuality;
     group.add(wallMesh);
 
     // 3. Steep Pitched Roof (Brown wood underside)
@@ -481,7 +520,7 @@ export class SnowWorld {
     const roofMesh = new THREE.Mesh(roofGeo, roofMat);
     roofMesh.position.y = 4.4;
     roofMesh.scale.set(1.1, 1.0, 0.9);
-    roofMesh.castShadow = !this.isHeadless;
+    roofMesh.castShadow = !this.lowQuality;
     group.add(roofMesh);
 
     // 4. Thick Fluffy Snow Drift on Roof
@@ -491,7 +530,7 @@ export class SnowWorld {
     const snowCapMesh = new THREE.Mesh(snowCapGeo, snowCapMat);
     snowCapMesh.position.y = 4.55;
     snowCapMesh.scale.set(1.12, 1.0, 0.92);
-    snowCapMesh.castShadow = !this.isHeadless;
+    snowCapMesh.castShadow = !this.lowQuality;
     group.add(snowCapMesh);
 
     // 5. Chimney with Brick Texture
@@ -499,7 +538,7 @@ export class SnowWorld {
     const chimneyMat = new THREE.MeshStandardMaterial({ color: 0x874335, roughness: 0.85 });
     const chimney = new THREE.Mesh(chimneyGeo, chimneyMat);
     chimney.position.set(1.2, 4.6, 0.8);
-    chimney.castShadow = !this.isHeadless;
+    chimney.castShadow = !this.lowQuality;
     group.add(chimney);
 
     // 6. Glowing Amber Windows
@@ -537,7 +576,7 @@ export class SnowWorld {
     const trunkGeo = new THREE.CylinderGeometry(0.25, 0.4, 2.0, 6);
     const trunk = new THREE.Mesh(trunkGeo, trunkMat);
     trunk.position.y = 1.0;
-    trunk.castShadow = !this.isHeadless;
+    trunk.castShadow = !this.lowQuality;
     group.add(trunk);
 
     // 3 Tiered Cones for Foliage + Snow
@@ -552,14 +591,14 @@ export class SnowWorld {
       const fGeo = new THREE.ConeGeometry(t.rad, t.h, 7);
       const fMesh = new THREE.Mesh(fGeo, foliageMat);
       fMesh.position.y = t.y;
-      fMesh.castShadow = !this.isHeadless;
+      fMesh.castShadow = !this.lowQuality;
       group.add(fMesh);
 
       // Snow Cap on Tier
       const sGeo = new THREE.ConeGeometry(t.rad * 0.95, t.h * 0.6, 7);
       const sMesh = new THREE.Mesh(sGeo, snowMat);
       sMesh.position.y = t.y + 0.28;
-      sMesh.castShadow = !this.isHeadless;
+      sMesh.castShadow = !this.lowQuality;
       group.add(sMesh);
     });
 
@@ -581,7 +620,7 @@ export class SnowWorld {
     const postGeo = new THREE.CylinderGeometry(0.08, 0.14, 3.2, 8);
     const post = new THREE.Mesh(postGeo, ironMat);
     post.position.y = 1.6;
-    post.castShadow = !this.isHeadless;
+    post.castShadow = !this.lowQuality;
     group.add(post);
 
     // Lantern Head
@@ -606,17 +645,17 @@ export class SnowWorld {
     // 3 Snow spheres
     const b1 = new THREE.Mesh(new THREE.SphereGeometry(0.8, 12, 10), snowMat);
     b1.position.y = 0.75;
-    b1.castShadow = !this.isHeadless;
+    b1.castShadow = !this.lowQuality;
     group.add(b1);
 
     const b2 = new THREE.Mesh(new THREE.SphereGeometry(0.55, 12, 10), snowMat);
     b2.position.y = 1.7;
-    b2.castShadow = !this.isHeadless;
+    b2.castShadow = !this.lowQuality;
     group.add(b2);
 
     const b3 = new THREE.Mesh(new THREE.SphereGeometry(0.38, 12, 10), snowMat);
     b3.position.y = 2.4;
-    b3.castShadow = !this.isHeadless;
+    b3.castShadow = !this.lowQuality;
     group.add(b3);
 
     // Carrot Nose
@@ -655,7 +694,7 @@ export class SnowWorld {
     });
     const chassis = new THREE.Mesh(chassisGeo, chassisMat);
     chassis.position.y = 0.45;
-    chassis.castShadow = !this.isHeadless;
+    chassis.castShadow = !this.lowQuality;
     this.vehicleGroup.add(chassis);
 
     // 2. Main Cabin (Bright Safety Orange-Yellow)
@@ -667,7 +706,7 @@ export class SnowWorld {
     });
     const cabin = new THREE.Mesh(cabinGeo, cabinMat);
     cabin.position.set(0, 1.2, -0.2);
-    cabin.castShadow = !this.isHeadless;
+    cabin.castShadow = !this.lowQuality;
     this.vehicleGroup.add(cabin);
 
     // 3. Cabin Panoramic Glass (Dark glossy glass with cyan tint)
@@ -727,7 +766,7 @@ export class SnowWorld {
       wheelHub.position.set(off.x, off.y, off.z);
 
       const tire = new THREE.Mesh(wheelGeo, wheelMat);
-      tire.castShadow = !this.isHeadless;
+      tire.castShadow = !this.lowQuality;
       wheelHub.add(tire);
 
       const rim = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.38, 12).rotateZ(Math.PI / 2), rimMat);
@@ -807,7 +846,7 @@ export class SnowWorld {
 
     this.bladeMesh = new THREE.Mesh(bladeGeo, bladeMat);
     this.bladeMesh.position.set(0, 0.42, 1.85);
-    this.bladeMesh.castShadow = !this.isHeadless;
+    this.bladeMesh.castShadow = !this.lowQuality;
     this.vehicleGroup.add(this.bladeMesh);
   }
 
@@ -902,7 +941,8 @@ export class SnowWorld {
       depthWrite: false,
     });
 
-    this.smokeInstancedMesh = new THREE.InstancedMesh(smokeGeo, smokeMat, this.smokeParticles.length);
+    this.smokeInstancedMesh = new THREE.InstancedMesh(smokeGeo, smokeMat, this.MAX_SMOKE); // room for any village
+    this.smokeInstancedMesh.count = this.smokeParticles.length;
     this.smokeInstancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.smokeInstancedMesh.frustumCulled = false;
     this.scene.add(this.smokeInstancedMesh);
@@ -999,10 +1039,40 @@ export class SnowWorld {
     if (this.clearedRoadPixels < this.totalRoadPixels && this.clearedRoadPixels >= this.totalRoadPixels * AUTO_FINISH_RATIO) {
       this.meltRemainingSnow();
     }
-    this.metrics.cleanPercent = calculateCleanliness(this.clearedRoadPixels, this.totalRoadPixels);
-    this.metrics.snowClearedSqM = Math.round(this.clearedRoadPixels * (this.WORLD_SIZE / W) ** 2);
+    this.syncCleanMetrics();
 
     return cleared;
+  }
+
+  private syncCleanMetrics(): void {
+    this.metrics.cleanPercent = calculateCleanliness(this.clearedRoadPixels, this.totalRoadPixels);
+    this.metrics.snowClearedSqM = Math.round(this.clearedRoadPixels * (this.WORLD_SIZE / this.CANVAS_RES) ** 2);
+  }
+
+  /** Blizzard: snow drifts back over cleared road in small patches, which pay again when re-plowed. */
+  private driftSnowBack(dt: number): void {
+    const W = this.CANVAS_RES;
+    const PATCH = 20; // ~pixels in a radius-2.6 patch
+    this.snowfallBank = Math.min(this.snowfallBank + this.weather.snowfallRate * this.totalRoadPixels * dt, 10 * PATCH);
+    const px = this.snowImage.data;
+    for (let tries = 0; this.snowfallBank >= PATCH && tries < 10; tries++) {
+      const seed = this.roadPixels[Math.floor(Math.random() * this.roadPixels.length)];
+      if (this.snowLeft[seed]) continue; // landed on snow that was never plowed
+      this.snowfallBank -= PATCH;
+      const cx = (seed % W) + 0.5;
+      const cy = Math.floor(seed / W) + 0.5;
+      forEachInDisc(W, cx, cy, 2.6, (i) => {
+        if (!this.roadMask[i] || this.snowLeft[i]) return;
+        this.snowLeft[i] = 1;
+        this.clearedRoadPixels--;
+        px[i * 4] = 248;
+        px[i * 4 + 1] = 252;
+        px[i * 4 + 2] = 255;
+      });
+      this.snowCtx.putImageData(this.snowImage, 0, 0, Math.floor(cx) - 3, Math.floor(cy) - 3, 7, 7);
+      this.snowTexture.needsUpdate = true;
+    }
+    this.syncCleanMetrics();
   }
 
   /** Paints one snow-map pixel as cleared. Grain is a hash of the pixel, so repainting never flickers. */
@@ -1037,7 +1107,22 @@ export class SnowWorld {
   /**
    * Update Physics & Simulation Frame
    */
-  public update(dt: number, input: { forward: boolean; backward: boolean; left: boolean; right: boolean; drift: boolean }): void {
+  public update(dt: number, input: DriveInput): void {
+    // Touch joystick: drive towards the dragged screen direction, relative to the camera
+    const sx = input.stickX ?? 0;
+    const sy = input.stickY ?? 0;
+    if (sx || sy) {
+      const cam = this.camera.getWorldDirection(this.tmpDir);
+      const len = Math.hypot(cam.x, cam.z) || 1;
+      const fx = cam.x / len; // screen-up on the ground
+      const fz = cam.z / len;
+      const wx = -fz * sx - fx * sy;
+      const wz = fx * sx - fz * sy;
+      let diff = Math.atan2(wx, wz) - this.vehicleHeading;
+      diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+      input = { ...input, forward: Math.hypot(sx, sy) > 0.3, left: diff > 0.12, right: diff < -0.12 };
+    }
+
     // 1. Vehicle Movement & Steering
     const maxSpd = this.stats.maxSpeed;
     const accel = this.stats.accel;
@@ -1119,12 +1204,14 @@ export class SnowWorld {
     this.metrics.comboTimer = combo.timer;
     this.metrics.maxCombo = Math.max(this.metrics.maxCombo, combo.combo);
 
-    const gain = calculateSnowPlowGain(clearedPercent, combo.combo);
+    const gain = calculateSnowPlowGain(clearedPercent * this.villagePay, combo.combo);
     this.metrics.score += gain.scoreGain;
     this.coinBank += gain.coinsGain;
     const wholeCoins = Math.floor(this.coinBank);
     this.metrics.coins += wholeCoins;
     this.coinBank -= wholeCoins;
+
+    if (this.weather.snowfallRate > 0) this.driftSnowBack(dt);
 
     // 5. Snow Blower Recharge
     if (this.stats.hasBlower && this.metrics.blowerCharge < 1.0) {
@@ -1324,10 +1411,12 @@ export class SnowWorld {
   }
 
   public resetRun(): void {
-    this.vehiclePos.set(0, 0.4, 0);
-    this.vehicleHeading = 0;
+    this.vehiclePos.set(this.spawn.x, 0.4, this.spawn.z);
+    this.vehicleHeading = this.spawn.heading;
     this.vehicleSpeed = 0;
     this.vehicleSteer = 0;
+    this.cameraTarget.copy(this.vehiclePos);
+    this.snowfallBank = 0;
     // Coins carry over; everything about the run starts fresh (a stale 100% re-triggered victory instantly)
     Object.assign(this.metrics, {
       snowClearedSqM: 0,
@@ -1362,7 +1451,7 @@ export class SnowWorld {
     this.renderer.render(this.scene, this.camera);
   };
 
-  public renderDirect(dt: number, state: 'title' | 'playing' | 'paused' | 'gameover', input: { forward: boolean; backward: boolean; left: boolean; right: boolean; drift: boolean }): void {
+  public renderDirect(dt: number, state: 'title' | 'playing' | 'paused' | 'gameover', input: DriveInput): void {
     if (state === 'playing') {
       this.update(dt, input);
     }

@@ -7,6 +7,22 @@ export const MAX_UPGRADE_LEVEL = 5;
 export const COMBO_MAX_TIMER = 2.5; // seconds to keep combo alive
 export const MAX_COMBO_MULTIPLIER = 5.0;
 export const AUTO_FINISH_RATIO = 0.98; // salt truck melts the last specks, nobody hunts single pixels
+export const STORM_CALMS_AT = 90; // percent clean at which a blizzard eases to flurries
+
+/** Visits every pixel whose centre lies inside the disc (clamped to the map). */
+export function forEachInDisc(size: number, cx: number, cy: number, r: number, visit: (i: number) => void): void {
+  const x0 = Math.max(0, Math.floor(cx - r));
+  const x1 = Math.min(size - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r));
+  const y1 = Math.min(size - 1, Math.ceil(cy + r));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = x + 0.5 - cx;
+      const dy = y + 0.5 - cy;
+      if (dx * dx + dy * dy <= r * r) visit(y * size + x);
+    }
+  }
+}
 
 /**
  * Clears a disc on the snow ledger (1 = road pixel still under snow, 0 = clear or off-road).
@@ -22,24 +38,57 @@ export function clearSnowDisc(
   paint?: (i: number) => void
 ): number {
   let cleared = 0;
-  const x0 = Math.max(0, Math.floor(cx - r));
-  const x1 = Math.min(size - 1, Math.ceil(cx + r));
-  const y0 = Math.max(0, Math.floor(cy - r));
-  const y1 = Math.min(size - 1, Math.ceil(cy + r));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const dx = x + 0.5 - cx;
-      const dy = y + 0.5 - cy;
-      if (dx * dx + dy * dy > r * r) continue;
-      const i = y * size + x;
-      if (snow[i]) {
-        snow[i] = 0;
-        cleared++;
-      }
-      paint?.(i);
+  forEachInDisc(size, cx, cy, r, (i) => {
+    if (snow[i]) {
+      snow[i] = 0;
+      cleared++;
     }
-  }
+    paint?.(i);
+  });
   return cleared;
+}
+
+export interface SaveData {
+  coins: number;
+  upgrades: UpgradesState;
+  village: number; // index of the village being played
+  best: (number | null)[]; // best clear time per village, seconds
+}
+
+export function newSave(): SaveData {
+  return {
+    coins: 20, // starting cozy pocket money
+    upgrades: { bladeWidth: 1, enginePower: 1, saltSpreader: 0, snowBlower: 0 },
+    village: 0,
+    best: [],
+  };
+}
+
+/** Reads a localStorage save; anything missing, corrupt or out of range falls back to a fresh value. */
+export function parseSave(raw: string | null, villageCount: number): SaveData {
+  const save = newSave();
+  let data: Partial<SaveData>;
+  try {
+    data = JSON.parse(raw ?? 'null') ?? {};
+  } catch {
+    return save;
+  }
+  const num = (v: unknown, min: number, max: number, fallback: number) =>
+    typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, Math.floor(v))) : fallback;
+
+  save.coins = num(data.coins, 0, 1e9, save.coins);
+  save.village = num(data.village, 0, villageCount - 1, 0);
+  const up = (data.upgrades ?? {}) as Partial<UpgradesState>;
+  save.upgrades = {
+    bladeWidth: num(up.bladeWidth, 1, MAX_UPGRADE_LEVEL, 1),
+    enginePower: num(up.enginePower, 1, MAX_UPGRADE_LEVEL, 1),
+    saltSpreader: num(up.saltSpreader, 0, 4, 0),
+    snowBlower: num(up.snowBlower, 0, 4, 0),
+  };
+  save.best = Array.isArray(data.best)
+    ? data.best.slice(0, villageCount).map((t) => (typeof t === 'number' && t > 0 ? t : null))
+    : [];
+  return save;
 }
 
 /**
@@ -226,6 +275,7 @@ export const WEATHER_PRESETS: Record<WeatherType, WeatherConfig> = {
     fogColor: 0xd2e1ee,
     lightIntensity: 1.4,
     windAudioVolume: 0.15,
+    snowfallRate: 0,
   },
   sunny: {
     type: 'sunny',
@@ -240,6 +290,7 @@ export const WEATHER_PRESETS: Record<WeatherType, WeatherConfig> = {
     fogColor: 0xd6eaff,
     lightIntensity: 1.9,
     windAudioVolume: 0.05,
+    snowfallRate: 0,
   },
   blizzard: {
     type: 'blizzard',
@@ -254,6 +305,7 @@ export const WEATHER_PRESETS: Record<WeatherType, WeatherConfig> = {
     fogColor: 0x9bb0c4,
     lightIntensity: 0.9,
     windAudioVolume: 0.75,
+    snowfallRate: 0.0008, // ~0.08% of the road per second drifts back over
   },
 };
 

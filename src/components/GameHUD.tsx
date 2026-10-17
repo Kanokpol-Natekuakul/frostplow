@@ -16,52 +16,92 @@ import {
   Award,
 } from 'lucide-react';
 import type { GameMetrics, UpgradesState, WeatherType } from '../game/types.ts';
-import { getUpgradeInfo } from '../game/logic.ts';
-import { soundEngine } from '../game/audio.ts';
+import { getUpgradeInfo, getWeatherPreset } from '../game/logic.ts';
+import type { VirtualInput } from '../game/input.ts';
+
+/** Touch joystick: drag the knob the way you want the tractor to go. */
+const Joystick: React.FC<{ onMove: (x: number, y: number) => void }> = ({ onMove }) => {
+  const [knob, setKnob] = useState({ x: 0, y: 0 });
+  const RANGE = 44; // px of knob travel
+  const track = (e: React.PointerEvent<HTMLDivElement>) => {
+    const box = e.currentTarget.getBoundingClientRect();
+    let x = (e.clientX - box.left - box.width / 2) / RANGE;
+    let y = (e.clientY - box.top - box.height / 2) / RANGE;
+    const len = Math.hypot(x, y);
+    if (len > 1) {
+      x /= len;
+      y /= len;
+    }
+    setKnob({ x, y });
+    onMove(x, y);
+  };
+  const release = () => {
+    setKnob({ x: 0, y: 0 });
+    onMove(0, 0);
+  };
+  return (
+    <div
+      aria-label="Drive joystick"
+      className="pointer-events-auto touch-none relative w-32 h-32 rounded-full bg-slate-950/60 border border-slate-700 shadow-lg"
+      onPointerDown={(e) => {
+        e.currentTarget.setPointerCapture(e.pointerId);
+        track(e);
+      }}
+      onPointerMove={(e) => {
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) track(e);
+      }}
+      onPointerUp={release}
+      onPointerCancel={release}
+    >
+      <div
+        className="absolute left-1/2 top-1/2 -ml-7 -mt-7 w-14 h-14 rounded-full bg-amber-500/90 border-2 border-amber-300 shadow-lg"
+        style={{ transform: `translate(${knob.x * RANGE}px, ${knob.y * RANGE}px)` }}
+      />
+    </div>
+  );
+};
 
 interface GameHUDProps {
   metrics: GameMetrics;
   upgrades: UpgradesState;
+  villageName: string;
   weatherType: WeatherType;
   cameraMode: 'isometric' | 'close' | 'top';
   isMuted: boolean;
   onUpgrade: (type: keyof UpgradesState) => void;
-  onSetWeather: (type: WeatherType) => void;
   onToggleCamera: () => void;
   onToggleMute: () => void;
   onPause: () => void;
-  onVirtualInput: (input: Partial<{ forward: boolean; backward: boolean; left: boolean; right: boolean; action: boolean }>) => void;
+  onVirtualInput: (input: Partial<VirtualInput>) => void;
 }
 
 export const GameHUD: React.FC<GameHUDProps> = ({
   metrics,
   upgrades,
+  villageName,
   weatherType,
   cameraMode,
   isMuted,
   onUpgrade,
-  onSetWeather,
   onToggleCamera,
   onToggleMute,
   onPause,
   onVirtualInput,
 }) => {
   const [isDockOpen, setIsDockOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<'upgrades' | 'weather' | 'objectives'>('upgrades');
+  const [activeTab, setActiveTab] = useState<'upgrades' | 'objectives'>('upgrades');
+  const weather = getWeatherPreset(weatherType);
 
-  // Keyboard shortcut listener for Workshop (U) and Blizzard (B)
+  // Keyboard shortcut listener for Workshop (U)
   React.useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'KeyU') {
         setIsDockOpen((prev) => !prev);
       }
-      if (e.code === 'KeyB') {
-        onSetWeather(weatherType === 'blizzard' ? 'flurries' : 'blizzard');
-      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [weatherType, onSetWeather]);
+  }, []);
 
   const bladeInfo = getUpgradeInfo('bladeWidth', upgrades.bladeWidth);
   const engineInfo = getUpgradeInfo('enginePower', upgrades.enginePower);
@@ -75,11 +115,11 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   };
 
   return (
-    <div className="absolute inset-0 z-10 pointer-events-none select-none flex flex-col justify-between p-3 md:p-6 overflow-hidden">
+    <div className="absolute inset-0 z-10 pointer-events-none select-none flex flex-col p-3 md:p-6 overflow-hidden">
       {/* Top Perimeter Status Cluster */}
-      <div className="flex justify-between items-start w-full">
+      <div className="flex flex-wrap justify-between items-start gap-2 w-full">
         {/* Top-Left: Village Cleanliness & Score */}
-        <div className="pointer-events-auto flex items-center gap-3 p-3 rounded-2xl bg-slate-950/85 border border-slate-800 shadow-xl text-white">
+        <div className="pointer-events-auto shrink-0 flex items-center gap-3 p-3 rounded-2xl bg-slate-950/85 border border-slate-800 shadow-xl text-white">
           {/* Circular Cleanliness Ring */}
           <div className="relative w-12 h-12 flex items-center justify-center">
             <svg className="w-full h-full -rotate-90" viewBox="0 0 36 36">
@@ -106,10 +146,10 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           </div>
 
           <div className="flex flex-col">
-            <span className="text-[10px] font-semibold tracking-wider text-slate-400 uppercase">
+            <span className="text-[10px] font-semibold tracking-wider text-slate-400 uppercase whitespace-nowrap">
               VILLAGE CLEANLINESS
             </span>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 whitespace-nowrap">
               <span className="text-sm font-semibold tabular-nums text-slate-200">
                 {metrics.snowClearedSqM} <span className="text-xs text-slate-400 font-normal">m²</span>
               </span>
@@ -130,16 +170,13 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             <CloudSnow className="w-4 h-4 text-sky-300" />
           )}
           <span className="font-medium">
-            {weatherType === 'blizzard'
-              ? 'Mountain Blizzard · -12°C'
-              : weatherType === 'sunny'
-              ? 'Alpine Sunlight · +1°C'
-              : 'Gentle Flurries · -3°C'}
+            {villageName} · {weather.label} · {weather.temperatureC > 0 ? '+' : ''}
+            {weather.temperatureC}°C
           </span>
         </div>
 
         {/* Top-Right: Action & Utility Buttons */}
-        <div className="pointer-events-auto flex items-center gap-2">
+        <div className="pointer-events-auto flex items-center gap-2 ml-auto">
           {/* Snow Cannon Charge (if unlocked) */}
           {upgrades.snowBlower > 0 && (
             <div
@@ -150,7 +187,10 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               }`}
             >
               <Zap className="w-3.5 h-3.5" />
-              <span>{metrics.blowerCharge >= 1.0 ? 'CANNON [Space]' : `${Math.round(metrics.blowerCharge * 100)}%`}</span>
+              <span>
+                {metrics.blowerCharge >= 1.0 ? 'CANNON' : `${Math.round(metrics.blowerCharge * 100)}%`}
+                {metrics.blowerCharge >= 1.0 && <span className="pointer-coarse:hidden"> [Space]</span>}
+              </span>
             </div>
           )}
 
@@ -203,49 +243,19 @@ export const GameHUD: React.FC<GameHUDProps> = ({
         </div>
       )}
 
-      {/* Mobile On-Screen Virtual Controls */}
-      <div className="pointer-events-none flex sm:hidden justify-between items-end w-full px-2 mb-2">
-        {/* D-Pad Buttons */}
-        <div className="pointer-events-auto grid grid-cols-3 gap-1.5 p-2 rounded-2xl bg-slate-950/80 border border-slate-800">
-          <div />
-          <button
-            onTouchStart={() => onVirtualInput({ forward: true })}
-            onTouchEnd={() => onVirtualInput({ forward: false })}
-            className="w-11 h-11 rounded-lg bg-slate-800 active:bg-amber-600 text-white font-bold flex items-center justify-center text-sm"
-          >
-            ▲
-          </button>
-          <div />
-          <button
-            onTouchStart={() => onVirtualInput({ left: true })}
-            onTouchEnd={() => onVirtualInput({ left: false })}
-            className="w-11 h-11 rounded-lg bg-slate-800 active:bg-amber-600 text-white font-bold flex items-center justify-center text-sm"
-          >
-            ◀
-          </button>
-          <button
-            onTouchStart={() => onVirtualInput({ backward: true })}
-            onTouchEnd={() => onVirtualInput({ backward: false })}
-            className="w-11 h-11 rounded-lg bg-slate-800 active:bg-amber-600 text-white font-bold flex items-center justify-center text-sm"
-          >
-            ▼
-          </button>
-          <button
-            onTouchStart={() => onVirtualInput({ right: true })}
-            onTouchEnd={() => onVirtualInput({ right: false })}
-            className="w-11 h-11 rounded-lg bg-slate-800 active:bg-amber-600 text-white font-bold flex items-center justify-center text-sm"
-          >
-            ▶
-          </button>
-        </div>
+      <div className="flex-1" />
 
-        {/* Action Button for Blower / Drift */}
-        <button
-          onTouchStart={() => onVirtualInput({ action: true })}
-          className="pointer-events-auto w-14 h-14 rounded-2xl bg-amber-500 active:bg-amber-600 text-slate-950 font-black shadow-lg flex items-center justify-center text-xs uppercase"
-        >
-          Blast
-        </button>
+      {/* Touch controls: any touch screen, portrait or landscape */}
+      <div className="pointer-events-none hidden pointer-coarse:flex justify-between items-end w-full px-2 mb-2">
+        <Joystick onMove={(x, y) => onVirtualInput({ stickX: x, stickY: y })} />
+        {upgrades.snowBlower > 0 && (
+          <button
+            onPointerDown={() => onVirtualInput({ action: true })}
+            className="pointer-events-auto touch-none w-16 h-16 rounded-2xl bg-amber-500 active:bg-amber-600 text-slate-950 font-black shadow-lg flex items-center justify-center text-xs uppercase"
+          >
+            Blast
+          </button>
+        )}
       </div>
 
       {/* Bottom Center Collapsible Cozy Dock */}
@@ -257,7 +267,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           className="flex items-center gap-2 px-4 py-1.5 rounded-t-xl bg-slate-950/90 hover:bg-slate-900 border-t border-x border-slate-800 text-slate-300 text-xs font-semibold transition cursor-pointer shadow-lg active:scale-95"
         >
           <Wrench className="w-3.5 h-3.5 text-amber-400" />
-          <span>{isDockOpen ? 'Hide Workshop [U]' : 'Plow Workshop & Weather [U]'}</span>
+          <span>{isDockOpen ? 'Hide Workshop [U]' : 'Plow Workshop [U]'}</span>
           {isDockOpen ? <ChevronDown className="w-3.5 h-3.5 text-slate-400" /> : <ChevronUp className="w-3.5 h-3.5 text-slate-400" />}
           <span className="text-[10px] text-amber-400 font-mono bg-amber-950/50 px-1.5 py-0.5 rounded border border-amber-900/40">
             🪙 {metrics.coins}
@@ -279,18 +289,6 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               >
                 <Wrench className="w-3.5 h-3.5" />
                 Plow Upgrades
-              </button>
-
-              <button
-                onClick={() => setActiveTab('weather')}
-                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
-                  activeTab === 'weather'
-                    ? 'bg-sky-500/20 text-sky-400 border border-sky-500/40'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <CloudSnow className="w-3.5 h-3.5" />
-                Weather Chamber
               </button>
 
               <button
@@ -424,50 +422,6 @@ export const GameHUD: React.FC<GameHUDProps> = ({
                     )}
                   </div>
                 </div>
-              </div>
-            )}
-
-            {/* Tab 2: Weather Chamber */}
-            {activeTab === 'weather' && (
-              <div className="grid grid-cols-3 gap-2">
-                <button
-                  onClick={() => onSetWeather('flurries')}
-                  className={`p-3 rounded-xl border flex flex-col items-center text-center cursor-pointer transition ${
-                    weatherType === 'flurries'
-                      ? 'bg-sky-950/60 border-sky-400 text-white'
-                      : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <CloudSnow className="w-5 h-5 text-sky-300 mb-1" />
-                  <span className="text-xs font-bold">Gentle Flurries</span>
-                  <span className="text-[10px] text-slate-400 mt-0.5">-3°C · Light Breeze</span>
-                </button>
-
-                <button
-                  onClick={() => onSetWeather('sunny')}
-                  className={`p-3 rounded-xl border flex flex-col items-center text-center cursor-pointer transition ${
-                    weatherType === 'sunny'
-                      ? 'bg-amber-950/60 border-amber-400 text-white'
-                      : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Sun className="w-5 h-5 text-amber-400 mb-1" />
-                  <span className="text-xs font-bold">Alpine Sun</span>
-                  <span className="text-[10px] text-slate-400 mt-0.5">+1°C · Golden Glow</span>
-                </button>
-
-                <button
-                  onClick={() => onSetWeather('blizzard')}
-                  className={`p-3 rounded-xl border flex flex-col items-center text-center cursor-pointer transition ${
-                    weatherType === 'blizzard'
-                      ? 'bg-sky-900/70 border-sky-400 text-white'
-                      : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Wind className="w-5 h-5 text-sky-400 mb-1 animate-pulse" />
-                  <span className="text-xs font-bold">Heavy Blizzard</span>
-                  <span className="text-[10px] text-slate-400 mt-0.5">-12°C · Howling Wind</span>
-                </button>
               </div>
             )}
 

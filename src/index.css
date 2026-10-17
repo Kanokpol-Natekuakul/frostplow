@@ -1,1 +1,8 @@
 @import "tailwindcss";
+
+/* A game, not a page: no pull-to-refresh or rubber-banding when a drag starts on the canvas, no double-tap zoom */
+html,
+body {
+  overscroll-behavior: none;
+  touch-action: manipulation;
+}

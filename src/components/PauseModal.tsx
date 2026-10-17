@@ -30,7 +30,7 @@ export const PauseModal: React.FC<PauseModalProps> = ({
       className="absolute inset-0 z-30 flex items-center justify-center p-4 bg-slate-950/75 select-none"
       style={{ pointerEvents: 'auto' }}
     >
-      <div className="w-full max-w-md p-6 rounded-3xl bg-slate-900 border border-slate-700 shadow-2xl text-slate-100 flex flex-col space-y-5">
+      <div className="w-full max-w-md max-h-[calc(100dvh-2rem)] overflow-y-auto p-6 rounded-3xl bg-slate-900 border border-slate-700 shadow-2xl text-slate-100 flex flex-col space-y-5">
         {/* Modal Header */}
         <div className="flex items-center justify-between border-b border-slate-800 pb-4">
           <div className="flex items-center gap-2">
