@@ -5,6 +5,14 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type { WeatherConfig, VehicleStats, GameMetrics } from './types.ts';
 import { soundEngine } from './audio.ts';
+import {
+  AUTO_FINISH_RATIO,
+  WEATHER_PRESETS,
+  calculateCleanliness,
+  calculateSnowPlowGain,
+  clearSnowDisc,
+  updateCombo,
+} from './logic.ts';
 
 export interface WorldCallbacks {
   onMetricsUpdate: (metrics: Partial<GameMetrics>) => void;
@@ -48,7 +56,7 @@ export class SnowWorld {
   private snowParticles!: THREE.Points;
   private snowPositions!: Float32Array;
   private snowVelocities!: Float32Array;
-  private snowCount: number = 2500;
+  private snowCount = Math.max(...Object.values(WEATHER_PRESETS).map((w) => w.snowParticleCount)); // pool for the heaviest weather
 
   // Snow Spray / Blower Particle Pool
   private sprayParticles!: THREE.InstancedMesh;
@@ -72,6 +80,12 @@ export class SnowWorld {
   private clearedRoadPixels: number = 0;
   private roadMaskCanvas!: HTMLCanvasElement;
   private roadMaskCtx!: CanvasRenderingContext2D;
+  private roadMask = new Uint8Array(this.CANVAS_RES * this.CANVAS_RES); // 1 = road pixel
+  private snowLeft = new Uint8Array(this.CANVAS_RES * this.CANVAS_RES); // 1 = road pixel still under snow
+  private snowImage!: ImageData; // CPU copy of snowCanvas, painted per pixel
+  private freshPixels = 0; // road snow cleared since the last update (plow, salt, blower)
+  private coinBank = 0; // fractional coins not yet paid out
+  private plowingTimer = 0; // keeps crunch audio and spray steady across sub-pixel frames
 
   // Game Metrics
   private metrics: GameMetrics = {
@@ -283,11 +297,12 @@ export class SnowWorld {
     ctx.lineTo(W * 0.78, H * 0.78);
     ctx.stroke();
 
-    // Count road pixels for coverage metrics
+    // Count road pixels for coverage metrics and keep the mask for the snow ledger
     const imgData = ctx.getImageData(0, 0, W, H);
     let count = 0;
-    for (let i = 0; i < imgData.data.length; i += 4) {
-      if (imgData.data[i] > 100) count++;
+    for (let p = 0; p < this.roadMask.length; p++) {
+      this.roadMask[p] = imgData.data[p * 4] > 100 ? 1 : 0;
+      count += this.roadMask[p];
     }
     this.totalRoadPixels = count;
     this.metrics.totalSnowSqM = Math.round(count * (this.WORLD_SIZE / this.CANVAS_RES) ** 2);
@@ -313,19 +328,20 @@ export class SnowWorld {
     }
 
     // On top of roads: draw fresh deep powder snow (slightly elevated visual brightness)
-    const roadData = this.roadMaskCtx.getImageData(0, 0, W, H);
     const snowData = this.snowCtx.getImageData(0, 0, W, H);
-
-    for (let i = 0; i < roadData.data.length; i += 4) {
-      if (roadData.data[i] > 100) {
-        // Road surface is covered in deep powdery white snow
-        snowData.data[i] = 248;     // R
-        snowData.data[i + 1] = 252; // G
-        snowData.data[i + 2] = 255; // B
+    for (let p = 0; p < this.roadMask.length; p++) {
+      if (this.roadMask[p]) {
+        snowData.data[p * 4] = 248;     // R
+        snowData.data[p * 4 + 1] = 252; // G
+        snowData.data[p * 4 + 2] = 255; // B
       }
     }
     this.snowCtx.putImageData(snowData, 0, 0);
+    this.snowImage = snowData;
+    this.snowLeft.set(this.roadMask);
     this.clearedRoadPixels = 0;
+    this.freshPixels = 0;
+    if (this.snowTexture) this.snowTexture.needsUpdate = true;
   }
 
   private buildPerimeterHills(): void {
@@ -814,6 +830,7 @@ export class SnowWorld {
 
     const snowGeo = new THREE.BufferGeometry();
     snowGeo.setAttribute('position', new THREE.BufferAttribute(this.snowPositions, 3));
+    snowGeo.setDrawRange(0, this.weather.snowParticleCount);
 
     // Crisp soft circle snowflake texture
     const snowDotCanvas = document.createElement('canvas');
@@ -958,7 +975,6 @@ export class SnowWorld {
    */
   private clearSnowAtWorldPos(worldX: number, worldZ: number, radiusM: number, isPlowAction: boolean): number {
     const W = this.CANVAS_RES;
-    const H = this.CANVAS_RES;
 
     // Convert world [-WORLD_SIZE/2, WORLD_SIZE/2] to canvas [0, CANVAS_RES]
     const u = (worldX / this.WORLD_SIZE + 0.5);
@@ -966,43 +982,56 @@ export class SnowWorld {
 
     if (u < 0 || u > 1 || v < 0 || v > 1) return 0;
 
-    const cx = Math.floor(u * W);
-    const cy = Math.floor(v * H);
-    const cr = Math.max(3, Math.floor((radiusM / this.WORLD_SIZE) * W));
+    const cx = u * W;
+    const cy = v * W;
+    const r = Math.max(3, (radiusM / this.WORLD_SIZE) * W);
 
-    // Clear snow: paint dark cobblestone road texture onto snowCanvas!
-    this.snowCtx.save();
-    this.snowCtx.beginPath();
-    this.snowCtx.arc(cx, cy, cr, 0, Math.PI * 2);
-    this.snowCtx.clip();
-
-    // Wet dark road color with tire tracks
-    this.snowCtx.fillStyle = '#222730';
-    this.snowCtx.fillRect(cx - cr - 2, cy - cr - 2, cr * 2 + 4, cr * 2 + 4);
-
-    // Subtle cobblestone road texture noise and tire lines
-    this.snowCtx.fillStyle = '#323a47';
-    this.snowCtx.fillRect(cx - cr * 0.5, cy - cr * 0.5, cr, cr);
-
-    this.snowCtx.fillStyle = '#181b22';
-    this.snowCtx.fillRect(cx - cr * 0.7, cy - 2, cr * 0.35, 4);
-    this.snowCtx.fillRect(cx + cr * 0.35, cy - 2, cr * 0.35, 4);
-
-    this.snowCtx.restore();
-
+    // Road -> wet dark asphalt; meadow -> packed-snow tyre track (plow only)
+    const cleared = clearSnowDisc(this.snowLeft, W, cx, cy, r, (i) => this.paintCleared(i, isPlowAction));
+    const x0 = Math.max(0, Math.floor(cx - r));
+    const y0 = Math.max(0, Math.floor(cy - r));
+    const span = Math.ceil(2 * r) + 2;
+    this.snowCtx.putImageData(this.snowImage, 0, 0, x0, y0, span, span);
     this.snowTexture.needsUpdate = true;
 
-    // Estimate cleared units
-    const clearedThisStep = Math.round(cr * 2.2);
-    this.clearedRoadPixels += clearedThisStep;
+    this.freshPixels += cleared;
+    this.clearedRoadPixels += cleared;
+    if (this.clearedRoadPixels < this.totalRoadPixels && this.clearedRoadPixels >= this.totalRoadPixels * AUTO_FINISH_RATIO) {
+      this.meltRemainingSnow();
+    }
+    this.metrics.cleanPercent = calculateCleanliness(this.clearedRoadPixels, this.totalRoadPixels);
+    this.metrics.snowClearedSqM = Math.round(this.clearedRoadPixels * (this.WORLD_SIZE / W) ** 2);
 
-    const currentClean = Math.min(100, Math.round((this.clearedRoadPixels / this.totalRoadPixels) * 100));
-    const clearedSqM = Math.round(this.clearedRoadPixels * (this.WORLD_SIZE / this.CANVAS_RES) ** 2);
+    return cleared;
+  }
 
-    this.metrics.cleanPercent = currentClean;
-    this.metrics.snowClearedSqM = clearedSqM;
+  /** Paints one snow-map pixel as cleared. Grain is a hash of the pixel, so repainting never flickers. */
+  private paintCleared(i: number, isPlowAction: boolean): void {
+    const px = this.snowImage.data;
+    const x = i % this.CANVAS_RES;
+    const y = (i - x) / this.CANVAS_RES;
+    const grain = ((x * 73856093) ^ (y * 19349663)) & 15;
+    if (this.roadMask[i]) {
+      px[i * 4] = 28 + grain;
+      px[i * 4 + 1] = 33 + grain;
+      px[i * 4 + 2] = 42 + grain;
+    } else if (isPlowAction) {
+      px[i * 4] = 208 + grain;
+      px[i * 4 + 1] = 221 + grain;
+      px[i * 4 + 2] = 236 + grain;
+    }
+  }
 
-    return clearedThisStep;
+  /** Last specks of the village melt on their own once the plow has done the real work. */
+  private meltRemainingSnow(): void {
+    for (let i = 0; i < this.snowLeft.length; i++) {
+      if (!this.snowLeft[i]) continue;
+      this.snowLeft[i] = 0;
+      this.paintCleared(i, false);
+    }
+    this.snowCtx.putImageData(this.snowImage, 0, 0);
+    this.snowTexture.needsUpdate = true;
+    this.clearedRoadPixels = this.totalRoadPixels;
   }
 
   /**
@@ -1050,19 +1079,14 @@ export class SnowWorld {
     this.updateVehicleTransform();
 
     // 2. Snow Plowing Action
-    let clearedThisFrame = 0;
+    let plowedThisFrame = 0;
     const isMovingForward = this.vehicleSpeed > 0.5;
 
     if (isMovingForward) {
       // Clear swath ahead of plow blade
       const plowAheadX = this.vehiclePos.x + forwardX * 1.8;
       const plowAheadZ = this.vehiclePos.z + forwardZ * 1.8;
-      clearedThisFrame = this.clearSnowAtWorldPos(plowAheadX, plowAheadZ, this.stats.plowWidth * 0.55, true);
-
-      // Emit snow chunks when moving
-      if (Math.random() < 0.65) {
-        this.emitSnowSpray(input.drift ? 6 : 3, false);
-      }
+      plowedThisFrame = this.clearSnowAtWorldPos(plowAheadX, plowAheadZ, this.stats.plowWidth * 0.55, true);
 
       // Salt Spreader behind vehicle if unlocked
       if (this.stats.saltRadius > 0 && Math.random() < 0.3) {
@@ -1072,31 +1096,35 @@ export class SnowWorld {
       }
     }
 
+    // Only real snow crunches and sprays; the short hold bridges frames that move less than a pixel
+    this.plowingTimer = plowedThisFrame > 0 ? 0.15 : Math.max(0, this.plowingTimer - dt);
+    const isPlowingSnow = isMovingForward && this.plowingTimer > 0;
+    if (isPlowingSnow && Math.random() < 0.65) {
+      this.emitSnowSpray(input.drift ? 6 : 3, false);
+    }
+
     // 3. Update Audio Synthesizer
     const speedRatio = Math.abs(this.vehicleSpeed) / maxSpd;
-    soundEngine.updateFrame(speedRatio, isMovingForward && clearedThisFrame > 0, this.weather.windAudioVolume);
+    soundEngine.updateFrame(speedRatio, isPlowingSnow, this.weather.windAudioVolume);
 
-    // 4. Update Combo & Metrics
-    if (clearedThisFrame > 0) {
-      this.metrics.comboTimer = 2.5;
-      const nextCombo = Math.min(5.0, this.metrics.comboMultiplier + 0.03 * (this.vehicleSpeed / maxSpd));
-      if (Math.floor(nextCombo * 2) > Math.floor(this.metrics.comboMultiplier * 2)) {
-        soundEngine.playComboChime(nextCombo);
-        this.callbacks.onComboStepped(nextCombo);
-      }
-      this.metrics.comboMultiplier = nextCombo;
-      this.metrics.maxCombo = Math.max(this.metrics.maxCombo, nextCombo);
-
-      const scoreGain = Math.round(clearedThisFrame * 8 * this.metrics.comboMultiplier);
-      const coinGain = Math.round(clearedThisFrame * 0.2 * this.metrics.comboMultiplier);
-      this.metrics.score += scoreGain;
-      this.metrics.coins += coinGain;
-    } else {
-      this.metrics.comboTimer = Math.max(0, this.metrics.comboTimer - dt);
-      if (this.metrics.comboTimer <= 0) {
-        this.metrics.comboMultiplier = 1.0;
-      }
+    // 4. Combo & payout from road snow actually cleared since last frame (plow, salt, blower)
+    const clearedPercent = (this.freshPixels / this.totalRoadPixels) * 100;
+    this.freshPixels = 0;
+    const combo = updateCombo(this.metrics.comboMultiplier, this.metrics.comboTimer, clearedPercent, dt);
+    if (combo.steppedUp) {
+      soundEngine.playComboChime(combo.combo);
+      this.callbacks.onComboStepped(combo.combo);
     }
+    this.metrics.comboMultiplier = combo.combo;
+    this.metrics.comboTimer = combo.timer;
+    this.metrics.maxCombo = Math.max(this.metrics.maxCombo, combo.combo);
+
+    const gain = calculateSnowPlowGain(clearedPercent, combo.combo);
+    this.metrics.score += gain.scoreGain;
+    this.coinBank += gain.coinsGain;
+    const wholeCoins = Math.floor(this.coinBank);
+    this.metrics.coins += wholeCoins;
+    this.coinBank -= wholeCoins;
 
     // 5. Snow Blower Recharge
     if (this.stats.hasBlower && this.metrics.blowerCharge < 1.0) {
@@ -1145,7 +1173,7 @@ export class SnowWorld {
     const windX = Math.cos(windDir) * windSpeed;
     const windZ = Math.sin(windDir) * windSpeed;
 
-    for (let i = 0; i < this.snowCount; i++) {
+    for (let i = 0; i < this.weather.snowParticleCount; i++) {
       const idx = i * 3;
       pos[idx] += (vel[idx] + windX) * dt;
       pos[idx + 1] += vel[idx + 1] * dt;
@@ -1267,6 +1295,7 @@ export class SnowWorld {
 
   public setWeather(newWeather: WeatherConfig): void {
     this.weather = newWeather;
+    this.snowParticles.geometry.setDrawRange(0, newWeather.snowParticleCount);
     this.scene.background = new THREE.Color(newWeather.skyColor);
     if (this.scene.fog instanceof THREE.FogExp2) {
       this.scene.fog.color.setHex(newWeather.fogColor);
@@ -1299,10 +1328,17 @@ export class SnowWorld {
     this.vehicleHeading = 0;
     this.vehicleSpeed = 0;
     this.vehicleSteer = 0;
-    this.metrics.score = 0;
-    this.metrics.comboMultiplier = 1.0;
-    this.metrics.comboTimer = 0;
-    this.metrics.shiftDurationSec = 0;
+    // Coins carry over; everything about the run starts fresh (a stale 100% re-triggered victory instantly)
+    Object.assign(this.metrics, {
+      snowClearedSqM: 0,
+      cleanPercent: 0,
+      score: 0,
+      comboMultiplier: 1.0,
+      comboTimer: 0,
+      maxCombo: 1.0,
+      shiftDurationSec: 0,
+      blowerCharge: 1.0,
+    });
     this.resetSnow();
     this.updateVehicleTransform();
   }

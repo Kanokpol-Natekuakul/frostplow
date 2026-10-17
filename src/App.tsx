@@ -109,6 +109,7 @@ export default function App() {
       }
     );
     worldRef.current = world;
+    if (import.meta.env.DEV) (window as any).__frost = world; // live checks from the browser console
     world.addCoins(20); // Grant starter coins
 
     // Unified Game Simulation Loop
@@ -126,8 +127,8 @@ export default function App() {
       const activeState = gameStateRef.current;
 
       if (currentInput) {
-        // Handle Action Triggers
-        if (currentInput.consumeAction()) {
+        // Handle Action Triggers (always consumed, so a press while paused doesn't fire on resume)
+        if (currentInput.consumeAction() && activeState === 'playing') {
           world.triggerSnowCannon();
         }
 

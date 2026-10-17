@@ -6,6 +6,41 @@ import type { UpgradesState, VehicleStats, UpgradeTier, WeatherType, WeatherConf
 export const MAX_UPGRADE_LEVEL = 5;
 export const COMBO_MAX_TIMER = 2.5; // seconds to keep combo alive
 export const MAX_COMBO_MULTIPLIER = 5.0;
+export const AUTO_FINISH_RATIO = 0.98; // salt truck melts the last specks, nobody hunts single pixels
+
+/**
+ * Clears a disc on the snow ledger (1 = road pixel still under snow, 0 = clear or off-road).
+ * Calls `paint` for every pixel inside the disc and returns how many road pixels were newly cleared,
+ * so driving over cleared road or open meadow earns nothing.
+ */
+export function clearSnowDisc(
+  snow: Uint8Array,
+  size: number,
+  cx: number,
+  cy: number,
+  r: number,
+  paint?: (i: number) => void
+): number {
+  let cleared = 0;
+  const x0 = Math.max(0, Math.floor(cx - r));
+  const x1 = Math.min(size - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r));
+  const y1 = Math.min(size - 1, Math.ceil(cy + r));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = x + 0.5 - cx;
+      const dy = y + 0.5 - cy;
+      if (dx * dx + dy * dy > r * r) continue;
+      const i = y * size + x;
+      if (snow[i]) {
+        snow[i] = 0;
+        cleared++;
+      }
+      paint?.(i);
+    }
+  }
+  return cleared;
+}
 
 /**
  * Calculates current vehicle mechanical stats based on purchased upgrades
@@ -107,6 +142,7 @@ export function getUpgradeInfo(type: keyof UpgradesState, currentLevel: number):
  * Combo state machine
  * As long as player clears snow continuously, combo counter steps up:
  * 1.0x -> 1.5x -> 2.0x -> 2.5x -> 3.0x -> 4.0x -> 5.0x
+ * `clearedSnowAmount` is the percent of the village's road snow cleared this frame.
  */
 export function updateCombo(
   currentCombo: number,
@@ -122,10 +158,10 @@ export function updateCombo(
   if (clearedSnowAmount > 0) {
     // Refresh timer
     timer = COMBO_MAX_TIMER;
-    // Step up combo gradually based on continuous snow plowed
+    // +1.0x per 4% of the village cleared in one unbroken streak
     const nextCombo = Math.min(
       MAX_COMBO_MULTIPLIER,
-      combo + clearedSnowAmount * 0.008
+      combo + clearedSnowAmount * 0.25
     );
     // Check if integer or half-step threshold reached
     if (Math.floor(nextCombo * 2) > Math.floor(combo * 2)) {
@@ -148,7 +184,9 @@ export function updateCombo(
 }
 
 /**
- * Calculates score and coin gains based on plowed snow and active multiplier
+ * Score and coin gains for `clearedAmount` percent of the village's road snow.
+ * Fractional on purpose: per-frame amounts are tiny, so rounding here would make income depend on FPS.
+ * The caller accumulates and pays out whole coins.
  */
 export function calculateSnowPlowGain(
   clearedAmount: number,
@@ -156,19 +194,19 @@ export function calculateSnowPlowGain(
 ): { scoreGain: number; coinsGain: number } {
   if (clearedAmount <= 0) return { scoreGain: 0, coinsGain: 0 };
   const effectiveMul = Math.max(1.0, multiplier);
-  const scoreGain = Math.round(clearedAmount * 10 * effectiveMul);
-  // 1 coin per ~8-10 snow units with multiplier
-  const coinsGain = Math.max(0, Math.floor((clearedAmount * 0.25 * effectiveMul)));
+  const scoreGain = clearedAmount * 10 * effectiveMul;
+  // A whole village pays 400 coins at 1x (~1000 with a typical combo)
+  const coinsGain = clearedAmount * 4 * effectiveMul;
   return { scoreGain, coinsGain };
 }
 
 /**
- * Percentage of village road cleared (0% to 100%)
+ * Percentage of village road cleared (0% to 100%), floored so the HUD never shows 100% early
  */
 export function calculateCleanliness(clearedUnits: number, totalSnowUnits: number): number {
   if (totalSnowUnits <= 0) return 100;
   const ratio = clearedUnits / totalSnowUnits;
-  return Math.min(100, Math.round(ratio * 100));
+  return Math.min(100, Math.floor(ratio * 100));
 }
 
 /**

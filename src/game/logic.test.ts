@@ -6,6 +6,7 @@ import {
   updateCombo,
   calculateSnowPlowGain,
   calculateCleanliness,
+  clearSnowDisc,
   getWeatherPreset,
 } from './logic.ts';
 
@@ -50,9 +51,9 @@ test('getUpgradeInfo computes progressive costs and stat labels', () => {
 });
 
 test('updateCombo steps up with plowing and decays with inactivity', () => {
-  // Start combo and cross first 1.5x tier
-  const initial = updateCombo(1.0, 0, 75, 0.016);
-  assert.ok(initial.combo >= 1.5);
+  // 2% of the village in one streak crosses the first 1.5x tier
+  const initial = updateCombo(1.0, 0, 2, 0.016);
+  assert.equal(initial.combo, 1.5);
   assert.equal(initial.steppedUp, true);
   assert.ok(initial.timer > 2.0);
 
@@ -74,11 +75,26 @@ test('calculateSnowPlowGain factors in multiplier', () => {
   const zeroGain = calculateSnowPlowGain(0, 5.0);
   assert.equal(zeroGain.scoreGain, 0);
   assert.equal(zeroGain.coinsGain, 0);
+
+  // Tiny per-frame amounts still pay (rounding them away made income depend on FPS)
+  assert.ok(calculateSnowPlowGain(0.01, 1.0).coinsGain > 0);
+});
+
+test('clearSnowDisc pays only for road snow that is still there', () => {
+  const size = 32;
+  const snow = new Uint8Array(size * size);
+  snow.fill(1, 16 * size, 17 * size); // one road row at y = 16
+
+  assert.equal(clearSnowDisc(snow, size, 10, 16.5, 3), 6);
+  assert.equal(clearSnowDisc(snow, size, 10, 16.5, 3), 0); // same spot again: nothing left
+  assert.equal(clearSnowDisc(snow, size, 10, 5, 3), 0); // meadow: no road snow
+  assert.equal(clearSnowDisc(snow, size, -50, -50, 3), 0); // off the map
 });
 
 test('calculateCleanliness scales cleanly to 100%', () => {
   assert.equal(calculateCleanliness(0, 1000), 0);
   assert.equal(calculateCleanliness(500, 1000), 50);
+  assert.equal(calculateCleanliness(999, 1000), 99); // never shows 100% before it is
   assert.equal(calculateCleanliness(1000, 1000), 100);
   assert.equal(calculateCleanliness(1200, 1000), 100);
 });
