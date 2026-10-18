@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Google AI Studio session artifacts (kept locally, not published)
+.aistudio/

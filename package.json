@@ -9,8 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test \"src/**/*.test.ts\"",
-    "deploy": "npm run build && node scripts/deploy-cloudflare.mjs"
+    "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
